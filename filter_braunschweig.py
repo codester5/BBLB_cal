@@ -79,7 +79,6 @@ def save_meta(meta):
 def fetch():
     headers = {}
     meta = load_meta()
-    # only set conditional headers if values present
     if meta.get("ETag"):
         headers["If-None-Match"] = meta["ETag"]
     if meta.get("Last-Modified"):
@@ -92,12 +91,10 @@ def fetch():
         return None, meta
     r.raise_for_status()
     new_meta = {}
-    # capture ETag/Last-Modified only if present
     if r.headers.get("ETag"):
         new_meta["ETag"] = r.headers.get("ETag")
     if r.headers.get("Last-Modified"):
         new_meta["Last-Modified"] = r.headers.get("Last-Modified")
-    # always return text for 200
     return r.text, new_meta
 
 
@@ -121,22 +118,43 @@ def clean_summary(name):
     return n
 
 
-def to_local_naive(dt):
+def ensure_datetime(obj):
+    """
+    Return a datetime (naive or aware) from various ics types or datetime.
+    """
+    if obj is None:
+        return None
+    try:
+        if hasattr(obj, "naive"):
+            return obj.naive  # naive datetime
+        if hasattr(obj, "datetime"):
+            return obj.datetime  # possibly aware
+    except Exception:
+        pass
+    return obj
+
+
+def wallclock_as_local_naive(dt):
+    """
+    Interpret the wall-clock time of dt as Europe/Berlin local time and return naive local datetime.
+    Rules:
+      - If dt is aware (has tzinfo), take its wall-clock components (year,month,day,hour,minute,second)
+        and build a LOCAL_TZ-aware datetime with those components, then return naive local datetime.
+      - If dt is naive, take its components as-is and treat them as LOCAL_TZ local time.
+    This preserves the displayed clock time while writing TZID=Europe/Berlin.
+    """
     if dt is None:
         return None
-    py_dt = dt
-    try:
-        if hasattr(dt, "datetime"):
-            py_dt = dt.datetime
-    except Exception:
-        py_dt = dt
-    # if naive, assume UTC
-    if getattr(py_dt, "tzinfo", None) is None:
-        aware = py_dt.replace(tzinfo=timezone.utc)
-    else:
-        aware = py_dt
-    local = aware.astimezone(LOCAL_TZ)
-    return local.replace(tzinfo=None)
+    py_dt = ensure_datetime(dt)
+    if py_dt is None:
+        return None
+    # Extract wall-clock fields
+    wc = dict(year=py_dt.year, month=py_dt.month, day=py_dt.day,
+              hour=py_dt.hour, minute=py_dt.minute, second=py_dt.second, microsecond=py_dt.microsecond)
+    # create a local-aware datetime using those fields
+    local_aware = datetime(**wc, tzinfo=LOCAL_TZ)
+    # return naive local (no tzinfo) for ICS writing with TZID
+    return local_aware.replace(tzinfo=None)
 
 
 def format_dt_as_local_string(dt):
@@ -166,26 +184,26 @@ def build_ics_text_with_vtimezone(cal_out):
         loc = getattr(ev, "location", "") or ""
         if loc:
             lines.append(f"LOCATION:{escape_ical_text(loc)}")
+
+        # BEGIN/END times: preserve wall-clock time and write TZID=Europe/Berlin
         b = getattr(ev, "begin", None)
         e = getattr(ev, "end", None)
-        try:
-            b_dt = b.naive if hasattr(b, "naive") else (b.datetime if hasattr(b, "datetime") else b)
-        except Exception:
-            b_dt = b
-        try:
-            e_dt = e.naive if hasattr(e, "naive") else (e.datetime if hasattr(e, "datetime") else e)
-        except Exception:
-            e_dt = e
-        b_local = to_local_naive(b_dt) if b_dt is not None else None
-        e_local = to_local_naive(e_dt) if e_dt is not None else None
-        if b_local:
-            lines.append(f"DTSTART;TZID={TZID}:{format_dt_as_local_string(b_local)}")
-        if e_local:
-            lines.append(f"DTEND;TZID={TZID}:{format_dt_as_local_string(e_local)}")
+        b_dt = ensure_datetime(b)
+        e_dt = ensure_datetime(e)
+
+        b_local_naive = wallclock_as_local_naive(b_dt) if b_dt is not None else None
+        e_local_naive = wallclock_as_local_naive(e_dt) if e_dt is not None else None
+
+        if b_local_naive:
+            lines.append(f"DTSTART;TZID={TZID}:{format_dt_as_local_string(b_local_naive)}")
+        if e_local_naive:
+            lines.append(f"DTEND;TZID={TZID}:{format_dt_as_local_string(e_local_naive)}")
+
+        # CREATED/DTSTAMP remain UTC if possible
         created = getattr(ev, "created", None)
         if created:
             try:
-                c_dt = created.naive if hasattr(created, "naive") else (created.datetime if hasattr(created, "datetime") else created)
+                c_dt = ensure_datetime(created)
                 if getattr(c_dt, "tzinfo", None) is None:
                     c_aware = c_dt.replace(tzinfo=timezone.utc)
                 else:
@@ -193,11 +211,15 @@ def build_ics_text_with_vtimezone(cal_out):
                 lines.append(f"CREATED:{c_aware.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
             except Exception:
                 pass
+
+        lines.append(f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+
         if not uid:
-            key = (summary + (format_dt_as_local_string(b_local) if b_local else "")).encode("utf-8")
+            key = (summary + (format_dt_as_local_string(b_local_naive) if b_local_naive else "")).encode("utf-8")
             import hashlib
             uid_gen = hashlib.sha1(key).hexdigest() + "@generated"
             lines.append(f"UID:{uid_gen}")
+
         lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines) + "\r\n"
@@ -222,20 +244,16 @@ def filter_calendar_to_string_with_tz(ics_text):
 
 def atomic_replace_with_backup(new_text):
     try:
-        # move existing out to bak if exists
         if os.path.exists(OUT_FILE):
             if os.path.exists(BAK_FILE):
                 os.remove(BAK_FILE)
             os.replace(OUT_FILE, BAK_FILE)
             logging.info("Existing %s moved to backup %s", OUT_FILE, BAK_FILE)
-        # write new temp file
         with open(NEW_FILE, "w", encoding="utf-8") as f:
             f.write(new_text)
         logging.info("Wrote new temp file %s", NEW_FILE)
-        # replace (works when OUT_FILE didn't exist)
         os.replace(NEW_FILE, OUT_FILE)
         logging.info("Replaced %s with new file", OUT_FILE)
-        # remove backup if present
         if os.path.exists(BAK_FILE):
             os.remove(BAK_FILE)
             logging.info("Removed backup %s", BAK_FILE)
@@ -262,15 +280,12 @@ def main():
     try:
         ics_text, new_meta = fetch()
         logging.info("Fetched feed: %s", "None" if ics_text is None else f"{len(ics_text)} bytes")
-        # If fetch returned None and we have no existing OUT_FILE, force a fetch (treat as update)
         if ics_text is None:
             if not os.path.exists(OUT_FILE):
                 logging.info("No existing output file but feed reported 304/None — forcing fresh fetch without conditional headers.")
-                # perform unconditional fetch
                 r = requests.get(URL, timeout=30)
                 r.raise_for_status()
                 ics_text = r.text
-                # capture headers if present
                 new_meta = {}
                 if r.headers.get("ETag"):
                     new_meta["ETag"] = r.headers.get("ETag")
