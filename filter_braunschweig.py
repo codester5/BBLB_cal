@@ -5,8 +5,8 @@ import os
 import sys
 import logging
 import tempfile
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from ics import Calendar, Event
 
 # --- Konfiguration ---
@@ -28,7 +28,7 @@ TZID = "Europe/Berlin"
 # ----------------------
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-LOCAL_TZ = pytz.timezone(TZID)
+LOCAL_TZ = ZoneInfo(TZID)
 
 
 VTIMEZONE_BLOCK = """BEGIN:VTIMEZONE
@@ -120,24 +120,29 @@ def clean_summary(name):
 def to_local_naive(dt):
     """
     Convert aware datetime (likely UTC) to local timezone and return naive local datetime.
-    If dt is a string, try to parse ISO-like; else if it's already naive, assume UTC then convert.
+    If dt is naive, treat as UTC then convert.
     """
     if dt is None:
         return None
-    if hasattr(dt, "naive") and hasattr(dt, "tzinfo"):
-        # ics library Event.begin is an Arrow-like object; convert to datetime
-        try:
-            py_dt = dt.datetime if hasattr(dt, "datetime") else dt
-        except Exception:
-            py_dt = dt
-    else:
+
+    py_dt = dt
+    # If dt has .datetime (ics Arrow-like), extract
+    try:
+        if hasattr(dt, "datetime"):
+            py_dt = dt.datetime
+    except Exception:
         py_dt = dt
-    # If py_dt has tzinfo:
+
+    # If py_dt is still not a datetime, return None
+    if not hasattr(py_dt, "tzinfo") and not hasattr(py_dt, "year"):
+        return None
+
+    # If naive -> assume UTC
     if getattr(py_dt, "tzinfo", None) is None:
-        # treat as UTC then convert
-        aware = pytz.UTC.localize(py_dt)
+        aware = py_dt.replace(tzinfo=timezone.utc)
     else:
         aware = py_dt
+
     local = aware.astimezone(LOCAL_TZ)
     # return naive local (no tzinfo) because we'll write DTSTART;TZID=Europe/Berlin:YYYYMMDDTHHMMSS
     return local.replace(tzinfo=None)
@@ -184,7 +189,6 @@ def build_ics_text_with_vtimezone(cal_out):
         if loc_escaped:
             lines.append(f"LOCATION:{loc_escaped}")
         # DTSTART and DTEND handling
-        # ev.begin and ev.end from ics.Event are arrow-like; convert to python datetime if possible
         b = getattr(ev, "begin", None)
         e = getattr(ev, "end", None)
         try:
@@ -209,15 +213,14 @@ def build_ics_text_with_vtimezone(cal_out):
                 c_dt = created.naive if hasattr(created, "naive") else (created.datetime if hasattr(created, "datetime") else created)
                 # ensure UTC Z format for CREATED
                 if getattr(c_dt, "tzinfo", None) is None:
-                    c_aware = pytz.UTC.localize(c_dt)
+                    c_aware = c_dt.replace(tzinfo=timezone.utc)
                 else:
                     c_aware = c_dt
-                lines.append(f"CREATED:{c_aware.astimezone(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}")
+                lines.append(f"CREATED:{c_aware.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
             except Exception:
                 pass
         # UID fallback if not present
         if not uid:
-            # try to use hash of summary+dt
             key = (summary + (format_dt_as_local_string(b_local) if b_local else "")).encode("utf-8")
             import hashlib
             uid_gen = hashlib.sha1(key).hexdigest() + "@generated"
