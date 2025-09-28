@@ -7,6 +7,7 @@ URL = "http://api.basketball-bundesliga.de/calendar/ical/all-games"
 TEAM_VARIANTS = ["Löwen Braunschweig", "Loewen Braunschweig", "Braunschweig", "Basketball Löwen"]
 OUT_FILE = "loewen_braunschweig.ics"
 META_FILE = ".feedmeta"  # stores ETag / Last-Modified
+REMOVE_PREFIX = "easyCredit BBL Spiel "
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -61,12 +62,22 @@ def matches_team(text):
             return True
     return False
 
+def clean_summary(name):
+    if not name:
+        return name
+    n = name.strip()
+    if n.lower().startswith(REMOVE_PREFIX.lower()):
+        n = n[len(REMOVE_PREFIX):].lstrip()
+    return n
+
 def filter_calendar(ics_text):
     cal = Calendar(ics_text)
     out = Calendar()
     for ev in cal.events:
         combined = " ".join(filter(None, [ev.name, ev.description, ev.location]))
         if matches_team(combined):
+            # clean the summary/title
+            ev.name = clean_summary(ev.name)
             out.events.add(ev)
     return out
 
