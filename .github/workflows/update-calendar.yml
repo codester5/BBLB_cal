@@ -2,7 +2,7 @@ name: Update Calendar
 on:
   schedule:
     - cron: '0 9 * * 1'   # Montag 09:00 UTC
-    - cron: '0 9 * * 4'   # Donnerstag 09:00 UTC
+#    - cron: '0 9 * * 4'   # Donnerstag 09:00 UTC
   workflow_dispatch: {}    # manuelles Auslösen möglich
 
 jobs:
