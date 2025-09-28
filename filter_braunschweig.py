@@ -16,6 +16,8 @@ TEAM_VARIANTS = [
     "Basketball Löwen",
 ]
 OUT_FILE = "loewen_braunschweig.ics"
+BAK_FILE = OUT_FILE + ".bak"   # deine _temp.ics (Sicherung der alten Datei)
+NEW_FILE = OUT_FILE + ".new"   # temporäre neue Datei während Generierung
 META_FILE = ".feedmeta"  # speichert ETag / Last-Modified
 REMOVE_PREFIXES = [
     "easyCredit BBL Spiel ",
@@ -59,11 +61,7 @@ def fetch():
     if "Last-Modified" in meta:
         headers["If-Modified-Since"] = meta["Last-Modified"]
     logging.info("Requesting feed...")
-    try:
-        r = requests.get(URL, headers=headers, timeout=30)
-    except Exception as e:
-        logging.error("HTTP request failed: %s", e)
-        raise
+    r = requests.get(URL, headers=headers, timeout=30)
     if r.status_code == 304:
         logging.info("Feed not modified (304).")
         return None, meta
@@ -96,12 +94,8 @@ def clean_summary(name):
     return n
 
 
-def filter_calendar(ics_text):
-    try:
-        cal = Calendar(ics_text)
-    except Exception as e:
-        logging.error("Failed to parse input calendar: %s", e)
-        raise
+def filter_calendar_to_string(ics_text):
+    cal = Calendar(ics_text)
     out = Calendar()
     matched = 0
     for ev in cal.events:
@@ -116,49 +110,67 @@ def filter_calendar(ics_text):
             )
         )
         if matches_team(combined):
-            # clean the summary/title if present
             try:
                 ev.name = clean_summary(getattr(ev, "name", None))
             except Exception:
-                # defensive: if setting name fails, skip cleaning
                 pass
             out.events.add(ev)
             matched += 1
     logging.info("Matched events: %d", matched)
-    return out
+    return str(out), matched
 
 
-def write_output_atomic_if_changed(cal):
-    new_text = str(cal)
-    old_text = ""
-    if os.path.exists(OUT_FILE):
-        try:
-            with open(OUT_FILE, "r", encoding="utf-8") as f:
-                old_text = f.read()
-        except Exception as e:
-            logging.warning("Could not read existing output file: %s", e)
-            old_text = ""
-    if new_text == old_text:
-        logging.info("No change in calendar content; not writing file.")
-        return False
-    # write to temp file and atomically replace
-    dir_name = os.path.dirname(os.path.abspath(OUT_FILE)) or "."
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=dir_name, text=True)
+def atomic_replace_with_backup(new_text):
+    """
+    Safe replace strategy:
+    - If OUT_FILE exists, rename it to BAK_FILE.
+    - Write NEW_FILE with new_text.
+    - If write successful, rename NEW_FILE -> OUT_FILE and remove BAK_FILE.
+    - On failure, remove NEW_FILE and restore BAK_FILE -> OUT_FILE.
+    """
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tf:
-            tf.write(new_text)
-        os.replace(tmp_path, OUT_FILE)  # atomic replace
-        logging.info("Wrote updated calendar to %s", OUT_FILE)
+        # make backup if exists
+        if os.path.exists(OUT_FILE):
+            # remove old bak if present to avoid conflicts
+            if os.path.exists(BAK_FILE):
+                os.remove(BAK_FILE)
+            os.replace(OUT_FILE, BAK_FILE)
+            logging.info("Existing %s moved to backup %s", OUT_FILE, BAK_FILE)
+
+        # write new content to NEW_FILE
+        with open(NEW_FILE, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        logging.info("Wrote new temp file %s", NEW_FILE)
+
+        # replace: NEW_FILE -> OUT_FILE
+        os.replace(NEW_FILE, OUT_FILE)
+        logging.info("Replaced %s with new file", OUT_FILE)
+
+        # remove backup
+        if os.path.exists(BAK_FILE):
+            os.remove(BAK_FILE)
+            logging.info("Removed backup %s", BAK_FILE)
         return True
     except Exception as e:
-        logging.error("Failed to write/replace output file: %s", e)
-        # cleanup tmp if exists
+        logging.error("Error during atomic replace: %s", e)
+        # cleanup new file if present
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(NEW_FILE):
+                os.remove(NEW_FILE)
+                logging.info("Removed failed new file %s", NEW_FILE)
         except Exception:
             pass
-        raise
+        # restore backup if exists
+        try:
+            if os.path.exists(BAK_FILE):
+                # if OUT_FILE exists for some reason, remove it first
+                if os.path.exists(OUT_FILE):
+                    os.remove(OUT_FILE)
+                os.replace(BAK_FILE, OUT_FILE)
+                logging.info("Restored backup %s to %s", BAK_FILE, OUT_FILE)
+        except Exception as e2:
+            logging.error("Failed to restore backup: %s", e2)
+        return False
 
 
 def main():
@@ -168,17 +180,28 @@ def main():
         if ics_text is None:
             logging.info("No update needed. Exiting.")
             return 0
-        out_cal = filter_calendar(ics_text)
-        logging.info("Preparing to write output file: %s", OUT_FILE)
-        changed = write_output_atomic_if_changed(out_cal)
-        if changed:
+
+        new_text, matched = filter_calendar_to_string(ics_text)
+        # If you want to avoid empty output, you can decide here:
+        # if matched == 0: ... (we proceed and write empty calendar)
+        logging.info("Preparing atomic replace of %s", OUT_FILE)
+        ok = atomic_replace_with_backup(new_text)
+        if ok:
             save_meta(new_meta)
-            logging.info("Wrote %s with %d events.", OUT_FILE, len(out_cal.events))
+            logging.info("Update successful. Wrote %s with %d events.", OUT_FILE, matched)
+            return 0
         else:
-            logging.info("File unchanged; meta not updated.")
-        return 0
+            logging.error("Update failed; backup restored.")
+            return 2
     except Exception as e:
-        logging.error("Error in main: %s", e)
+        logging.error("Fatal error: %s", e)
+        # Attempt to restore backup if something unexpected happened
+        try:
+            if os.path.exists(BAK_FILE) and not os.path.exists(OUT_FILE):
+                os.replace(BAK_FILE, OUT_FILE)
+                logging.info("Restored backup after fatal error.")
+        except Exception as e2:
+            logging.error("Failed to restore backup after fatal error: %s", e2)
         return 2
 
 
