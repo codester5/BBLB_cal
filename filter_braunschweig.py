@@ -104,3 +104,55 @@ def filter_calendar(ics_text):
     out = Calendar()
     matched = 0
     for ev in cal.events:
+        combined = " ".join(
+            filter(
+                None,
+                [
+                    getattr(ev, "name", ""),
+                    getattr(ev, "description", ""),
+                    getattr(ev, "location", ""),
+                ],
+            )
+        )
+        if matches_team(combined):
+            # clean the summary/title if present
+            try:
+                ev.name = clean_summary(getattr(ev, "name", None))
+            except Exception:
+                # defensive: if setting name fails, skip cleaning
+                pass
+            out.events.add(ev)
+            matched += 1
+    logging.info("Matched events: %d", matched)
+    return out
+
+
+def write_output(cal):
+    try:
+        with open(OUT_FILE, "w", encoding="utf-8") as f:
+            f.writelines(cal)
+    except Exception as e:
+        logging.error("Failed to write output file: %s", e)
+        raise
+
+
+def main():
+    try:
+        ics_text, new_meta = fetch()
+        logging.info("Fetched feed: %s", "None" if ics_text is None else f"{len(ics_text)} bytes")
+        if ics_text is None:
+            logging.info("No update needed. Exiting.")
+            return 0
+        out_cal = filter_calendar(ics_text)
+        logging.info("Writing output file: %s", OUT_FILE)
+        write_output(out_cal)
+        save_meta(new_meta)
+        logging.info("Wrote %s with %d events.", OUT_FILE, len(out_cal.events))
+        return 0
+    except Exception as e:
+        logging.error("Error in main: %s", e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
