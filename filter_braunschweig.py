@@ -4,10 +4,9 @@ import requests
 import os
 import sys
 import logging
-import tempfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from ics import Calendar, Event
+from ics import Calendar
 
 # --- Konfiguration ---
 URL = "http://api.basketball-bundesliga.de/calendar/ical/all-games"
@@ -71,7 +70,8 @@ def save_meta(meta):
     try:
         with open(META_FILE, "w", encoding="utf-8") as f:
             for k, v in meta.items():
-                f.write(f"{k}:{v}\n")
+                if v is not None and v != "":
+                    f.write(f"{k}:{v}\n")
     except Exception as e:
         logging.warning("Could not write meta: %s", e)
 
@@ -79,21 +79,25 @@ def save_meta(meta):
 def fetch():
     headers = {}
     meta = load_meta()
-    if "ETag" in meta:
+    # only set conditional headers if values present
+    if meta.get("ETag"):
         headers["If-None-Match"] = meta["ETag"]
-    if "Last-Modified" in meta:
+    if meta.get("Last-Modified"):
         headers["If-Modified-Since"] = meta["Last-Modified"]
-    logging.info("Requesting feed...")
+    logging.info("Requesting feed... headers=%s", headers)
     r = requests.get(URL, headers=headers, timeout=30)
+    logging.info("HTTP %s received", r.status_code)
     if r.status_code == 304:
         logging.info("Feed not modified (304).")
         return None, meta
     r.raise_for_status()
     new_meta = {}
-    if "ETag" in r.headers:
-        new_meta["ETag"] = r.headers["ETag"]
-    if "Last-Modified" in r.headers:
-        new_meta["Last-Modified"] = r.headers["Last-Modified"]
+    # capture ETag/Last-Modified only if present
+    if r.headers.get("ETag"):
+        new_meta["ETag"] = r.headers.get("ETag")
+    if r.headers.get("Last-Modified"):
+        new_meta["Last-Modified"] = r.headers.get("Last-Modified")
+    # always return text for 200
     return r.text, new_meta
 
 
@@ -118,77 +122,50 @@ def clean_summary(name):
 
 
 def to_local_naive(dt):
-    """
-    Convert aware datetime (likely UTC) to local timezone and return naive local datetime.
-    If dt is naive, treat as UTC then convert.
-    """
     if dt is None:
         return None
-
     py_dt = dt
-    # If dt has .datetime (ics Arrow-like), extract
     try:
         if hasattr(dt, "datetime"):
             py_dt = dt.datetime
     except Exception:
         py_dt = dt
-
-    # If py_dt is still not a datetime, return None
-    if not hasattr(py_dt, "tzinfo") and not hasattr(py_dt, "year"):
-        return None
-
-    # If naive -> assume UTC
+    # if naive, assume UTC
     if getattr(py_dt, "tzinfo", None) is None:
         aware = py_dt.replace(tzinfo=timezone.utc)
     else:
         aware = py_dt
-
     local = aware.astimezone(LOCAL_TZ)
-    # return naive local (no tzinfo) because we'll write DTSTART;TZID=Europe/Berlin:YYYYMMDDTHHMMSS
     return local.replace(tzinfo=None)
 
 
 def format_dt_as_local_string(dt):
-    # dt is naive local datetime
     return dt.strftime("%Y%m%dT%H%M%S")
 
 
+def escape_ical_text(s):
+    return s.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+
+
 def build_ics_text_with_vtimezone(cal_out):
-    """
-    Build ICS text manually:
-    - Insert VTIMEZONE block after BEGIN:VCALENDAR
-    - For each event, write DTSTART;TZID=Europe/Berlin:... and DTEND similarly
-    - Keep UID, DESCRIPTION, LOCATION, SUMMARY, and other common properties
-    """
     lines = []
     lines.append("BEGIN:VCALENDAR")
     lines.append("VERSION:2.0")
     lines.append("PRODID:-//Filtered Calendar//EN")
-    # Insert VTIMEZONE
     lines.append(VTIMEZONE_BLOCK.strip())
-    # iterate events
     for ev in cal_out.events:
         lines.append("BEGIN:VEVENT")
-        # UID
-        uid = getattr(ev, "uid", None) or getattr(ev, "uid", "")
+        uid = getattr(ev, "uid", None) or ""
         if uid:
             lines.append(f"UID:{uid}")
-        # SUMMARY
         summary = getattr(ev, "name", "") or ""
-        # escape commas and semicolons per RFC5545 minimally
-        summary_escaped = summary.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
-        lines.append(f"SUMMARY:{summary_escaped}")
-        # DESCRIPTION
+        lines.append(f"SUMMARY:{escape_ical_text(summary)}")
         desc = getattr(ev, "description", "") or ""
-        desc_escaped = desc.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
-        if desc_escaped:
-            lines.append(f"DESCRIPTION:{desc_escaped}")
-        # LOCATION
+        if desc:
+            lines.append(f"DESCRIPTION:{escape_ical_text(desc)}")
         loc = getattr(ev, "location", "") or ""
-        loc_escaped = loc.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
-        if loc_escaped:
-            lines.append(f"LOCATION:{loc_escaped}")
-        # DTSTART and DTEND handling
+        if loc:
+            lines.append(f"LOCATION:{escape_ical_text(loc)}")
         b = getattr(ev, "begin", None)
         e = getattr(ev, "end", None)
         try:
@@ -199,19 +176,16 @@ def build_ics_text_with_vtimezone(cal_out):
             e_dt = e.naive if hasattr(e, "naive") else (e.datetime if hasattr(e, "datetime") else e)
         except Exception:
             e_dt = e
-        # convert to local naive datetimes
         b_local = to_local_naive(b_dt) if b_dt is not None else None
         e_local = to_local_naive(e_dt) if e_dt is not None else None
         if b_local:
             lines.append(f"DTSTART;TZID={TZID}:{format_dt_as_local_string(b_local)}")
         if e_local:
             lines.append(f"DTEND;TZID={TZID}:{format_dt_as_local_string(e_local)}")
-        # other common fields: last-mod, created
         created = getattr(ev, "created", None)
         if created:
             try:
                 c_dt = created.naive if hasattr(created, "naive") else (created.datetime if hasattr(created, "datetime") else created)
-                # ensure UTC Z format for CREATED
                 if getattr(c_dt, "tzinfo", None) is None:
                     c_aware = c_dt.replace(tzinfo=timezone.utc)
                 else:
@@ -219,16 +193,13 @@ def build_ics_text_with_vtimezone(cal_out):
                 lines.append(f"CREATED:{c_aware.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
             except Exception:
                 pass
-        # UID fallback if not present
         if not uid:
             key = (summary + (format_dt_as_local_string(b_local) if b_local else "")).encode("utf-8")
             import hashlib
             uid_gen = hashlib.sha1(key).hexdigest() + "@generated"
             lines.append(f"UID:{uid_gen}")
-        # end
         lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
-    # join with CRLF per RFC
     return "\r\n".join(lines) + "\r\n"
 
 
@@ -237,41 +208,34 @@ def filter_calendar_to_string_with_tz(ics_text):
     out = Calendar()
     matched = 0
     for ev in cal.events:
-        combined = " ".join(
-            filter(
-                None,
-                [
-                    getattr(ev, "name", ""),
-                    getattr(ev, "description", ""),
-                    getattr(ev, "location", ""),
-                ],
-            )
-        )
+        combined = " ".join(filter(None, [getattr(ev, "name", ""), getattr(ev, "description", ""), getattr(ev, "location", "")]))
         if matches_team(combined):
-            # clean summary
             try:
                 ev.name = clean_summary(getattr(ev, "name", None))
             except Exception:
                 pass
             out.events.add(ev)
             matched += 1
-    # build ICS text with VTIMEZONE and TZID dates
     text = build_ics_text_with_vtimezone(out)
     return text, matched
 
 
 def atomic_replace_with_backup(new_text):
     try:
+        # move existing out to bak if exists
         if os.path.exists(OUT_FILE):
             if os.path.exists(BAK_FILE):
                 os.remove(BAK_FILE)
             os.replace(OUT_FILE, BAK_FILE)
             logging.info("Existing %s moved to backup %s", OUT_FILE, BAK_FILE)
+        # write new temp file
         with open(NEW_FILE, "w", encoding="utf-8") as f:
             f.write(new_text)
         logging.info("Wrote new temp file %s", NEW_FILE)
+        # replace (works when OUT_FILE didn't exist)
         os.replace(NEW_FILE, OUT_FILE)
         logging.info("Replaced %s with new file", OUT_FILE)
+        # remove backup if present
         if os.path.exists(BAK_FILE):
             os.remove(BAK_FILE)
             logging.info("Removed backup %s", BAK_FILE)
@@ -281,7 +245,6 @@ def atomic_replace_with_backup(new_text):
         try:
             if os.path.exists(NEW_FILE):
                 os.remove(NEW_FILE)
-                logging.info("Removed failed new file %s", NEW_FILE)
         except Exception:
             pass
         try:
@@ -299,10 +262,25 @@ def main():
     try:
         ics_text, new_meta = fetch()
         logging.info("Fetched feed: %s", "None" if ics_text is None else f"{len(ics_text)} bytes")
+        # If fetch returned None and we have no existing OUT_FILE, force a fetch (treat as update)
         if ics_text is None:
-            logging.info("No update needed. Exiting.")
-            return 0
+            if not os.path.exists(OUT_FILE):
+                logging.info("No existing output file but feed reported 304/None — forcing fresh fetch without conditional headers.")
+                # perform unconditional fetch
+                r = requests.get(URL, timeout=30)
+                r.raise_for_status()
+                ics_text = r.text
+                # capture headers if present
+                new_meta = {}
+                if r.headers.get("ETag"):
+                    new_meta["ETag"] = r.headers.get("ETag")
+                if r.headers.get("Last-Modified"):
+                    new_meta["Last-Modified"] = r.headers.get("Last-Modified")
+            else:
+                logging.info("No update needed. Exiting.")
+                return 0
         new_text, matched = filter_calendar_to_string_with_tz(ics_text)
+        logging.info("Found %d matching events", matched)
         logging.info("Preparing atomic replace of %s", OUT_FILE)
         ok = atomic_replace_with_backup(new_text)
         if ok:
