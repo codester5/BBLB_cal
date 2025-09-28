@@ -4,6 +4,7 @@ import requests
 import os
 import sys
 import logging
+import tempfile
 from ics import Calendar
 
 # --- Konfiguration ---
@@ -127,12 +128,36 @@ def filter_calendar(ics_text):
     return out
 
 
-def write_output(cal):
+def write_output_atomic_if_changed(cal):
+    new_text = str(cal)
+    old_text = ""
+    if os.path.exists(OUT_FILE):
+        try:
+            with open(OUT_FILE, "r", encoding="utf-8") as f:
+                old_text = f.read()
+        except Exception as e:
+            logging.warning("Could not read existing output file: %s", e)
+            old_text = ""
+    if new_text == old_text:
+        logging.info("No change in calendar content; not writing file.")
+        return False
+    # write to temp file and atomically replace
+    dir_name = os.path.dirname(os.path.abspath(OUT_FILE)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=dir_name, text=True)
     try:
-        with open(OUT_FILE, "w", encoding="utf-8") as f:
-            f.writelines(cal)
+        with os.fdopen(fd, "w", encoding="utf-8") as tf:
+            tf.write(new_text)
+        os.replace(tmp_path, OUT_FILE)  # atomic replace
+        logging.info("Wrote updated calendar to %s", OUT_FILE)
+        return True
     except Exception as e:
-        logging.error("Failed to write output file: %s", e)
+        logging.error("Failed to write/replace output file: %s", e)
+        # cleanup tmp if exists
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
         raise
 
 
@@ -144,10 +169,13 @@ def main():
             logging.info("No update needed. Exiting.")
             return 0
         out_cal = filter_calendar(ics_text)
-        logging.info("Writing output file: %s", OUT_FILE)
-        write_output(out_cal)
-        save_meta(new_meta)
-        logging.info("Wrote %s with %d events.", OUT_FILE, len(out_cal.events))
+        logging.info("Preparing to write output file: %s", OUT_FILE)
+        changed = write_output_atomic_if_changed(out_cal)
+        if changed:
+            save_meta(new_meta)
+            logging.info("Wrote %s with %d events.", OUT_FILE, len(out_cal.events))
+        else:
+            logging.info("File unchanged; meta not updated.")
         return 0
     except Exception as e:
         logging.error("Error in main: %s", e)
