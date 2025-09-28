@@ -5,7 +5,9 @@ import os
 import sys
 import logging
 import tempfile
-from ics import Calendar
+from datetime import datetime
+import pytz
+from ics import Calendar, Event
 
 # --- Konfiguration ---
 URL = "http://api.basketball-bundesliga.de/calendar/ical/all-games"
@@ -16,15 +18,36 @@ TEAM_VARIANTS = [
     "Basketball Löwen",
 ]
 OUT_FILE = "loewen_braunschweig.ics"
-BAK_FILE = OUT_FILE + ".bak"   # deine _temp.ics (Sicherung der alten Datei)
-NEW_FILE = OUT_FILE + ".new"   # temporäre neue Datei während Generierung
-META_FILE = ".feedmeta"  # speichert ETag / Last-Modified
+BAK_FILE = OUT_FILE + ".bak"
+NEW_FILE = OUT_FILE + ".new"
+META_FILE = ".feedmeta"
 REMOVE_PREFIXES = [
     "easyCredit BBL Spiel ",
 ]
+TZID = "Europe/Berlin"
 # ----------------------
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+LOCAL_TZ = pytz.timezone(TZID)
+
+
+VTIMEZONE_BLOCK = """BEGIN:VTIMEZONE
+TZID:{tz}
+X-LIC-LOCATION:{tz}
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+TZNAME:CET
+DTSTART:19701025T030000
+END:STANDARD
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+TZNAME:CEST
+DTSTART:19700329T020000
+END:DAYLIGHT
+END:VTIMEZONE
+""".format(tz=TZID)
 
 
 def load_meta():
@@ -94,7 +117,119 @@ def clean_summary(name):
     return n
 
 
-def filter_calendar_to_string(ics_text):
+def to_local_naive(dt):
+    """
+    Convert aware datetime (likely UTC) to local timezone and return naive local datetime.
+    If dt is a string, try to parse ISO-like; else if it's already naive, assume UTC then convert.
+    """
+    if dt is None:
+        return None
+    if hasattr(dt, "naive") and hasattr(dt, "tzinfo"):
+        # ics library Event.begin is an Arrow-like object; convert to datetime
+        try:
+            py_dt = dt.datetime if hasattr(dt, "datetime") else dt
+        except Exception:
+            py_dt = dt
+    else:
+        py_dt = dt
+    # If py_dt has tzinfo:
+    if getattr(py_dt, "tzinfo", None) is None:
+        # treat as UTC then convert
+        aware = pytz.UTC.localize(py_dt)
+    else:
+        aware = py_dt
+    local = aware.astimezone(LOCAL_TZ)
+    # return naive local (no tzinfo) because we'll write DTSTART;TZID=Europe/Berlin:YYYYMMDDTHHMMSS
+    return local.replace(tzinfo=None)
+
+
+def format_dt_as_local_string(dt):
+    # dt is naive local datetime
+    return dt.strftime("%Y%m%dT%H%M%S")
+
+
+def build_ics_text_with_vtimezone(cal_out):
+    """
+    Build ICS text manually:
+    - Insert VTIMEZONE block after BEGIN:VCALENDAR
+    - For each event, write DTSTART;TZID=Europe/Berlin:... and DTEND similarly
+    - Keep UID, DESCRIPTION, LOCATION, SUMMARY, and other common properties
+    """
+    lines = []
+    lines.append("BEGIN:VCALENDAR")
+    lines.append("VERSION:2.0")
+    lines.append("PRODID:-//Filtered Calendar//EN")
+    # Insert VTIMEZONE
+    lines.append(VTIMEZONE_BLOCK.strip())
+    # iterate events
+    for ev in cal_out.events:
+        lines.append("BEGIN:VEVENT")
+        # UID
+        uid = getattr(ev, "uid", None) or getattr(ev, "uid", "")
+        if uid:
+            lines.append(f"UID:{uid}")
+        # SUMMARY
+        summary = getattr(ev, "name", "") or ""
+        # escape commas and semicolons per RFC5545 minimally
+        summary_escaped = summary.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+        lines.append(f"SUMMARY:{summary_escaped}")
+        # DESCRIPTION
+        desc = getattr(ev, "description", "") or ""
+        desc_escaped = desc.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+        if desc_escaped:
+            lines.append(f"DESCRIPTION:{desc_escaped}")
+        # LOCATION
+        loc = getattr(ev, "location", "") or ""
+        loc_escaped = loc.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+        if loc_escaped:
+            lines.append(f"LOCATION:{loc_escaped}")
+        # DTSTART and DTEND handling
+        # ev.begin and ev.end from ics.Event are arrow-like; convert to python datetime if possible
+        b = getattr(ev, "begin", None)
+        e = getattr(ev, "end", None)
+        try:
+            b_dt = b.naive if hasattr(b, "naive") else (b.datetime if hasattr(b, "datetime") else b)
+        except Exception:
+            b_dt = b
+        try:
+            e_dt = e.naive if hasattr(e, "naive") else (e.datetime if hasattr(e, "datetime") else e)
+        except Exception:
+            e_dt = e
+        # convert to local naive datetimes
+        b_local = to_local_naive(b_dt) if b_dt is not None else None
+        e_local = to_local_naive(e_dt) if e_dt is not None else None
+        if b_local:
+            lines.append(f"DTSTART;TZID={TZID}:{format_dt_as_local_string(b_local)}")
+        if e_local:
+            lines.append(f"DTEND;TZID={TZID}:{format_dt_as_local_string(e_local)}")
+        # other common fields: last-mod, created
+        created = getattr(ev, "created", None)
+        if created:
+            try:
+                c_dt = created.naive if hasattr(created, "naive") else (created.datetime if hasattr(created, "datetime") else created)
+                # ensure UTC Z format for CREATED
+                if getattr(c_dt, "tzinfo", None) is None:
+                    c_aware = pytz.UTC.localize(c_dt)
+                else:
+                    c_aware = c_dt
+                lines.append(f"CREATED:{c_aware.astimezone(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}")
+            except Exception:
+                pass
+        # UID fallback if not present
+        if not uid:
+            # try to use hash of summary+dt
+            key = (summary + (format_dt_as_local_string(b_local) if b_local else "")).encode("utf-8")
+            import hashlib
+            uid_gen = hashlib.sha1(key).hexdigest() + "@generated"
+            lines.append(f"UID:{uid_gen}")
+        # end
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    # join with CRLF per RFC
+    return "\r\n".join(lines) + "\r\n"
+
+
+def filter_calendar_to_string_with_tz(ics_text):
     cal = Calendar(ics_text)
     out = Calendar()
     matched = 0
@@ -110,60 +245,44 @@ def filter_calendar_to_string(ics_text):
             )
         )
         if matches_team(combined):
+            # clean summary
             try:
                 ev.name = clean_summary(getattr(ev, "name", None))
             except Exception:
                 pass
             out.events.add(ev)
             matched += 1
-    logging.info("Matched events: %d", matched)
-    return str(out), matched
+    # build ICS text with VTIMEZONE and TZID dates
+    text = build_ics_text_with_vtimezone(out)
+    return text, matched
 
 
 def atomic_replace_with_backup(new_text):
-    """
-    Safe replace strategy:
-    - If OUT_FILE exists, rename it to BAK_FILE.
-    - Write NEW_FILE with new_text.
-    - If write successful, rename NEW_FILE -> OUT_FILE and remove BAK_FILE.
-    - On failure, remove NEW_FILE and restore BAK_FILE -> OUT_FILE.
-    """
     try:
-        # make backup if exists
         if os.path.exists(OUT_FILE):
-            # remove old bak if present to avoid conflicts
             if os.path.exists(BAK_FILE):
                 os.remove(BAK_FILE)
             os.replace(OUT_FILE, BAK_FILE)
             logging.info("Existing %s moved to backup %s", OUT_FILE, BAK_FILE)
-
-        # write new content to NEW_FILE
         with open(NEW_FILE, "w", encoding="utf-8") as f:
             f.write(new_text)
         logging.info("Wrote new temp file %s", NEW_FILE)
-
-        # replace: NEW_FILE -> OUT_FILE
         os.replace(NEW_FILE, OUT_FILE)
         logging.info("Replaced %s with new file", OUT_FILE)
-
-        # remove backup
         if os.path.exists(BAK_FILE):
             os.remove(BAK_FILE)
             logging.info("Removed backup %s", BAK_FILE)
         return True
     except Exception as e:
         logging.error("Error during atomic replace: %s", e)
-        # cleanup new file if present
         try:
             if os.path.exists(NEW_FILE):
                 os.remove(NEW_FILE)
                 logging.info("Removed failed new file %s", NEW_FILE)
         except Exception:
             pass
-        # restore backup if exists
         try:
             if os.path.exists(BAK_FILE):
-                # if OUT_FILE exists for some reason, remove it first
                 if os.path.exists(OUT_FILE):
                     os.remove(OUT_FILE)
                 os.replace(BAK_FILE, OUT_FILE)
@@ -180,10 +299,7 @@ def main():
         if ics_text is None:
             logging.info("No update needed. Exiting.")
             return 0
-
-        new_text, matched = filter_calendar_to_string(ics_text)
-        # If you want to avoid empty output, you can decide here:
-        # if matched == 0: ... (we proceed and write empty calendar)
+        new_text, matched = filter_calendar_to_string_with_tz(ics_text)
         logging.info("Preparing atomic replace of %s", OUT_FILE)
         ok = atomic_replace_with_backup(new_text)
         if ok:
@@ -195,7 +311,6 @@ def main():
             return 2
     except Exception as e:
         logging.error("Fatal error: %s", e)
-        # Attempt to restore backup if something unexpected happened
         try:
             if os.path.exists(BAK_FILE) and not os.path.exists(OUT_FILE):
                 os.replace(BAK_FILE, OUT_FILE)
