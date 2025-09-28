@@ -1,0 +1,38 @@
+name: Update Calendar
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Montag 09:00 UTC
+    - cron: '0 9 * * 4'   # Donnerstag 09:00 UTC
+  workflow_dispatch: {}    # manuelles Auslösen möglich
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run filter script
+        run: python filter_braunschweig.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add loewen_braunschweig.ics .feedmeta || true
+            git commit -m "Update loewen_braunschweig.ics (automated)"
+            git push
+          else
+            echo "No changes to commit"
+          fi
